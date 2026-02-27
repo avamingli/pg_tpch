@@ -86,6 +86,35 @@ END;
 $func$;
 
 -- =============================================================================
+-- config(key) — get config value
+-- config(key, value) — set config value (upsert)
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpch.config(cfg_key TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    _val TEXT;
+BEGIN
+    SELECT value INTO _val FROM tpch.config WHERE key = cfg_key;
+    RETURN _val;
+END;
+$func$;
+
+CREATE OR REPLACE FUNCTION tpch.config(cfg_key TEXT, cfg_value TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+BEGIN
+    UPDATE tpch.config SET value = cfg_value WHERE key = cfg_key;
+    IF NOT FOUND THEN
+        INSERT INTO tpch.config (key, value) VALUES (cfg_key, cfg_value);
+    END IF;
+    RETURN cfg_value;
+END;
+$func$;
+
+-- =============================================================================
 -- info() — show resolved configuration
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpch.info()
@@ -291,10 +320,14 @@ END;
 $func$;
 
 -- =============================================================================
--- gen_data(scale, parallel) — generate and load data via dbgen binary
+-- gen_data(scale, parallel) — generate .tbl files via dbgen binary
+-- Does NOT load into tables or delete files. Use load_data() afterwards.
 -- parallel defaults to 1 (sequential). Set parallel > 1 to run that many
 -- dbgen workers simultaneously, which can dramatically cut wall-clock time.
--- Example: SELECT tpch.gen_data(10, 8);  -- SF=10 with 8 parallel workers
+-- Example:
+--   SELECT tpch.gen_data(10, 8);   -- generate SF=10 with 8 parallel workers
+--   SELECT tpch.load_data();       -- load into tables
+--   SELECT tpch.clean_data();      -- free disk space when done
 --
 -- Note: unlike dsdgen, dbgen writes all chunks to the same filenames, so each
 -- worker gets its own subdirectory (<data_dir>/chunk_N/) to avoid conflicts.
@@ -306,16 +339,8 @@ AS $func$
 DECLARE
     _tpch_dir TEXT;
     _data_dir TEXT;
-    _tbl TEXT;
-    _tables TEXT[] := ARRAY[
-        'nation','region','part','supplier',
-        'partsupp','customer','orders','lineitem'
-    ];
     _start_ts TIMESTAMPTZ;
-    _row_count BIGINT;
-    _total_rows BIGINT := 0;
     _gen_cmd TEXT;
-    _load_cmd TEXT;
 BEGIN
     IF parallel < 1 THEN
         RAISE EXCEPTION 'parallel must be >= 1';
@@ -327,11 +352,6 @@ BEGIN
     IF _data_dir IS NULL OR _data_dir = '' THEN
         _data_dir := '/tmp/tpch_data';
     END IF;
-
-    -- Truncate all tables
-    FOREACH _tbl IN ARRAY _tables LOOP
-        EXECUTE format('TRUNCATE tpch.%I CASCADE', _tbl);
-    END LOOP;
 
     -- Generate data using dbgen binary.
     -- With parallel > 1: each worker gets its own subdirectory because dbgen
@@ -356,12 +376,62 @@ BEGIN
     RAISE NOTICE 'Data generation completed in % seconds',
         extract(epoch from clock_timestamp() - _start_ts);
 
+    -- Save scale_factor and parallel so load_data()/gen_query() can pick them up
+    UPDATE tpch.config SET value = scale_factor::TEXT WHERE key = 'scale_factor';
+    IF NOT FOUND THEN
+        INSERT INTO tpch.config (key, value) VALUES ('scale_factor', scale_factor::TEXT);
+    END IF;
+    UPDATE tpch.config SET value = parallel::TEXT WHERE key = 'parallel';
+    IF NOT FOUND THEN
+        INSERT INTO tpch.config (key, value) VALUES ('parallel', parallel::TEXT);
+    END IF;
+
+    RETURN format('Generated .tbl files at SF=%s (parallel=%s) in %s', scale_factor, parallel, _data_dir);
+END;
+$func$;
+
+-- =============================================================================
+-- load_data() — load .tbl files from data_dir into tables, then analyze
+-- Reads parallel from config (saved by gen_data) to determine file layout.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpch.load_data()
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    _data_dir TEXT;
+    _parallel INTEGER;
+    _tbl TEXT;
+    _tables TEXT[] := ARRAY[
+        'nation','region','part','supplier',
+        'partsupp','customer','orders','lineitem'
+    ];
+    _start_ts TIMESTAMPTZ;
+    _row_count BIGINT;
+    _total_rows BIGINT := 0;
+    _load_cmd TEXT;
+BEGIN
+    SELECT value INTO _data_dir FROM tpch.config WHERE key = 'data_dir';
+    IF _data_dir IS NULL OR _data_dir = '' THEN
+        _data_dir := '/tmp/tpch_data';
+    END IF;
+
+    SELECT value::INTEGER INTO _parallel FROM tpch.config WHERE key = 'parallel';
+    IF _parallel IS NULL THEN
+        _parallel := 1;
+    END IF;
+
+    -- Truncate all tables before loading
+    FOREACH _tbl IN ARRAY _tables LOOP
+        EXECUTE format('TRUNCATE tpch.%I CASCADE', _tbl);
+    END LOOP;
+
     -- Load each table via COPY FROM PROGRAM (strip trailing pipe).
     -- With parallel > 1, cat the same-named file from every chunk subdirectory.
     FOREACH _tbl IN ARRAY _tables LOOP
         _start_ts := clock_timestamp();
         BEGIN
-            IF parallel = 1 THEN
+            IF _parallel = 1 THEN
                 _load_cmd := format('sed ''s/|$//'' %s/%s.tbl', _data_dir, _tbl);
             ELSE
                 _load_cmd := format('cat %s/chunk_*/%s.tbl | sed ''s/|$//''',
@@ -386,23 +456,40 @@ BEGIN
         EXECUTE format('ANALYZE tpch.%I', _tbl);
     END LOOP;
 
-    -- Clean up .tbl files to free disk space
-    IF parallel = 1 THEN
+    RETURN format('Loaded %s total rows from %s', _total_rows, _data_dir);
+END;
+$func$;
+
+-- =============================================================================
+-- clean_data() — delete .tbl files from data_dir to free disk space
+-- =============================================================================
+CREATE OR REPLACE FUNCTION tpch.clean_data()
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    _data_dir TEXT;
+    _parallel INTEGER;
+BEGIN
+    SELECT value INTO _data_dir FROM tpch.config WHERE key = 'data_dir';
+    IF _data_dir IS NULL OR _data_dir = '' THEN
+        _data_dir := '/tmp/tpch_data';
+    END IF;
+
+    SELECT value::INTEGER INTO _parallel FROM tpch.config WHERE key = 'parallel';
+    IF _parallel IS NULL THEN
+        _parallel := 1;
+    END IF;
+
+    IF _parallel = 1 THEN
         EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
             format('rm -f %s/*.tbl', _data_dir));
     ELSE
         EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
             format('rm -rf %s/chunk_*', _data_dir));
     END IF;
-    RAISE NOTICE 'Cleaned up .tbl files from %', _data_dir;
 
-    -- Save scale factor so gen_query() can pick it up
-    UPDATE tpch.config SET value = scale_factor::TEXT WHERE key = 'scale_factor';
-    IF NOT FOUND THEN
-        INSERT INTO tpch.config (key, value) VALUES ('scale_factor', scale_factor::TEXT);
-    END IF;
-
-    RETURN format('Loaded %s total rows at SF=%s (parallel=%s)', _total_rows, scale_factor, parallel);
+    RETURN format('Cleaned up .tbl files from %s', _data_dir);
 END;
 $func$;
 
@@ -822,3 +909,20 @@ BEGIN
     PERFORM set_config('search_path', _saved_path, false);
 END;
 $func$;
+
+-- =============================================================================
+-- Extension loaded — remind user to configure data_dir
+-- =============================================================================
+DO $notice$
+BEGIN
+    RAISE WARNING E'\n'
+        '  tpch extension installed.\n'
+        '  Default data_dir is /tmp/tpch_data — this may be too small for large scale factors.\n'
+        '  To change it:  SELECT tpch.config(''data_dir'', ''/your/path'');\n'
+        '  Quick start:   SELECT tpch.gen_schema();\n'
+        '                 SELECT tpch.gen_data(1);\n'
+        '                 SELECT tpch.load_data();\n'
+        '                 SELECT tpch.gen_query();\n'
+        '                 SELECT tpch.bench();';
+END;
+$notice$;

@@ -37,10 +37,12 @@ make install
 ```sql
 CREATE EXTENSION tpch;        -- 1. install the extension
 SELECT tpch.gen_schema();     -- 2. create 8 TPC-H tables
-SELECT tpch.gen_data(1);      -- 3. generate & load SF-1 (~1GB) data (auto-analyzes, cleans up .tbl files)
-SELECT tpch.gen_data(1, 8);   -- 3. same, but generate data using 8 parallel workers
-SELECT tpch.gen_query();      -- 4. generate 22 queries, saved to query_dir as .sql files
-SELECT tpch.bench();          -- 5. run all 22 queries, results + summary.csv in results_dir
+SELECT tpch.gen_data(1);      -- 3. generate SF-1 (~1GB) .tbl files
+SELECT tpch.gen_data(1, 8);   -- 3. same, but with 8 parallel workers
+SELECT tpch.load_data();      -- 4. load .tbl files into tables (auto-analyzes)
+SELECT tpch.gen_query();      -- 5. generate 22 queries, saved to query_dir as .sql files
+SELECT tpch.bench();          -- 6. run all 22 queries, results + summary.csv in results_dir
+SELECT tpch.clean_data();     -- 7. (optional) delete .tbl files to free disk space
 ```
 
 That's it. Schema, data, queries, benchmark — done.
@@ -67,9 +69,13 @@ Per-query output is written to `results_dir` (`queryXX.out` or `queryXX_explain.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
+| `tpch.config(key)` | TEXT | Get config value |
+| `tpch.config(key, value)` | TEXT | Set config value |
 | `tpch.info()` | TABLE | Show all resolved paths and scale factor |
 | `tpch.gen_schema()` | TEXT | Create 8 TPC-H tables under `tpch` schema |
-| `tpch.gen_data(scale, parallel=1)` | TEXT | Generate data, load, and analyze all tables. Set `parallel > 1` to run that many dbgen workers simultaneously. |
+| `tpch.gen_data(scale, parallel=1)` | TEXT | Generate .tbl files via dbgen. Set `parallel > 1` for multiple workers. |
+| `tpch.load_data()` | TEXT | Load .tbl files into tables and analyze. Can be re-run without regenerating. |
+| `tpch.clean_data()` | TEXT | Delete .tbl files from data_dir to free disk space. |
 | `tpch.gen_query(seed)` | TEXT | Generate 22 queries, store in `tpch.query` table and `query_dir` |
 | `tpch.show(qid)` | TEXT | Return query text |
 | `tpch.exec(qid)` | TEXT | Execute one query, save result to `tpch.bench_results` |
@@ -150,20 +156,20 @@ SELECT * FROM tpch.info();
 Everything works out of the box. All directories except `data_dir` are auto-detected under the extension install path. Optional overrides:
 
 ```sql
-UPDATE tpch.config SET value = '/data/tpch' WHERE key = 'data_dir';
-UPDATE tpch.config SET value = '/data/results' WHERE key = 'results_dir';
-UPDATE tpch.config SET value = '/data/queries' WHERE key = 'query_dir';
+SELECT tpch.config('data_dir', '/data/tpch');
+SELECT tpch.config('results_dir', '/data/results');
+SELECT tpch.config('query_dir', '/data/queries');
 ```
 
 > **Disk space warning:** `gen_data()` writes raw `.tbl` files to `data_dir` before loading them into
-> PostgreSQL, then deletes them. The `.tbl` files are roughly the same size as the loaded data
-> (~1 GB per scale factor). Make sure `data_dir` has enough free space — at least **2× the scale
-> factor in GB** to account for both the `.tbl` files and the database storage. The default
-> `data_dir` is `/tmp/tpch_data`, which may be too small for large scale factors. Set it to a
-> partition with sufficient space before running `gen_data()`:
+> PostgreSQL. The `.tbl` files are roughly the same size as the loaded data (~1 GB per scale
+> factor). Make sure `data_dir` has enough free space — at least **2× the scale factor in GB** to
+> account for both the `.tbl` files and the database storage. The default `data_dir` is
+> `/tmp/tpch_data`, which may be too small for large scale factors. Set it to a partition with
+> sufficient space before running `gen_data()`:
 >
 > ```sql
-> UPDATE tpch.config SET value = '/data/tpch_tmp' WHERE key = 'data_dir';
+> SELECT tpch.config('data_dir', '/data/tpch_tmp');
 > SELECT tpch.gen_data(100, 8);  -- SF=100 needs ~100 GB in data_dir
 > ```
 
