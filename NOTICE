@@ -1,0 +1,25 @@
+NOTICE
+======
+
+TPC-H Benchmark
+----------------
+This repository contains code and queries derived from the TPC-H benchmark
+specification and tools, developed by the Transaction Processing Performance
+Council (TPC). TPC-H is a trademark of the Transaction Processing Performance
+Council (http://www.tpc.org/).
+
+The original TPC-H tools and specification are maintained by the TPC and are
+subject to the TPC's End User License Agreement (EULA). Files originating from
+the TPC retain their original copyright and license headers.
+
+This software is NOT an official TPC benchmark implementation. Any benchmark
+results produced by this tool should NOT be referred to as "TPC-H" results.
+Instead, results should be described as "derived from" or "based on" the TPC-H
+benchmark.
+
+For official TPC-H benchmark information, visit: https://www.tpc.org/tpch/
+
+PostgreSQL
+----------
+PostgreSQL is Copyright (c) 1996-2025, The PostgreSQL Global Development Group.
+PostgreSQL is released under the PostgreSQL License.

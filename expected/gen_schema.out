@@ -1,0 +1,35 @@
+CREATE EXTENSION tpch;
+SELECT tpch.gen_schema();
+              gen_schema               
+---------------------------------------
+ Created 8 TPC-H tables in tpch schema
+(1 row)
+
+SELECT count(*) FROM pg_tables WHERE schemaname = 'tpch'
+  AND tablename NOT IN ('config', 'query', 'bench_results', 'bench_summary');
+ count 
+-------
+     8
+(1 row)
+
+SELECT tablename FROM pg_tables WHERE schemaname = 'tpch'
+  AND tablename NOT IN ('config', 'query', 'bench_results', 'bench_summary')
+  ORDER BY tablename;
+ tablename 
+-----------
+ customer
+ lineitem
+ nation
+ orders
+ part
+ partsupp
+ region
+ supplier
+(8 rows)
+
+SHOW search_path;
+   search_path   
+-----------------
+ "$user", public
+(1 row)
+

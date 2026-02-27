@@ -1,0 +1,5 @@
+# tpch extension
+comment = 'TPC-H benchmark for PostgreSQL'
+default_version = '1.0'
+relocatable = false
+schema = tpch
