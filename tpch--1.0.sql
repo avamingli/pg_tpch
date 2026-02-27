@@ -291,9 +291,15 @@ END;
 $func$;
 
 -- =============================================================================
--- gen_data(scale) — generate and load data via dbgen binary
+-- gen_data(scale, parallel) — generate and load data via dbgen binary
+-- parallel defaults to 1 (sequential). Set parallel > 1 to run that many
+-- dbgen workers simultaneously, which can dramatically cut wall-clock time.
+-- Example: SELECT tpch.gen_data(10, 8);  -- SF=10 with 8 parallel workers
+--
+-- Note: unlike dsdgen, dbgen writes all chunks to the same filenames, so each
+-- worker gets its own subdirectory (<data_dir>/chunk_N/) to avoid conflicts.
 -- =============================================================================
-CREATE OR REPLACE FUNCTION tpch.gen_data(scale_factor INTEGER)
+CREATE OR REPLACE FUNCTION tpch.gen_data(scale_factor INTEGER, parallel INTEGER DEFAULT 1)
 RETURNS TEXT
 LANGUAGE plpgsql
 AS $func$
@@ -308,7 +314,13 @@ DECLARE
     _start_ts TIMESTAMPTZ;
     _row_count BIGINT;
     _total_rows BIGINT := 0;
+    _gen_cmd TEXT;
+    _load_cmd TEXT;
 BEGIN
+    IF parallel < 1 THEN
+        RAISE EXCEPTION 'parallel must be >= 1';
+    END IF;
+
     _tpch_dir := tpch._resolve_dir('tpch_dir', 'tpch_dbgen');
 
     SELECT value INTO _data_dir FROM tpch.config WHERE key = 'data_dir';
@@ -321,29 +333,43 @@ BEGIN
         EXECUTE format('TRUNCATE tpch.%I CASCADE', _tbl);
     END LOOP;
 
-    -- Create data directory
-    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'mkdir -p ' || _data_dir);
-
-    -- Generate data using dbgen binary
+    -- Generate data using dbgen binary.
+    -- With parallel > 1: each worker gets its own subdirectory because dbgen
+    -- always writes to the same filenames (no chunk suffix), so concurrent
+    -- workers would corrupt each other if they shared a directory.
     _start_ts := clock_timestamp();
-    EXECUTE format(
-        'COPY (SELECT 1) TO PROGRAM %L',
-        format('cd %s/dbgen && DSS_PATH=%s DSS_CONFIG=%s/dbgen ./dbgen -s %s -f',
-               _tpch_dir, _data_dir, _tpch_dir, scale_factor)
-    );
+    IF parallel = 1 THEN
+        EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'mkdir -p ' || _data_dir);
+        _gen_cmd := format(
+            'cd %s/dbgen && DSS_PATH=%s DSS_CONFIG=%s/dbgen ./dbgen -s %s -f',
+            _tpch_dir, _data_dir, _tpch_dir, scale_factor);
+    ELSE
+        -- Create per-worker subdirs and launch all workers in parallel via xargs.
+        EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+            format('seq 1 %s | xargs -P %s -I{} mkdir -p %s/chunk_{}',
+                   parallel, parallel, _data_dir));
+        _gen_cmd := format(
+            'cd %s/dbgen && seq 1 %s | xargs -P %s -I{} sh -c ''DSS_PATH=%s/chunk_{} DSS_CONFIG=%s/dbgen ./dbgen -s %s -f -C %s -S {}''',
+            _tpch_dir, parallel, parallel, _data_dir, _tpch_dir, scale_factor, parallel);
+    END IF;
+    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', _gen_cmd);
     RAISE NOTICE 'Data generation completed in % seconds',
         extract(epoch from clock_timestamp() - _start_ts);
 
-    -- Load each table via COPY FROM PROGRAM (strip trailing pipe)
+    -- Load each table via COPY FROM PROGRAM (strip trailing pipe).
+    -- With parallel > 1, cat the same-named file from every chunk subdirectory.
     FOREACH _tbl IN ARRAY _tables LOOP
         _start_ts := clock_timestamp();
         BEGIN
+            IF parallel = 1 THEN
+                _load_cmd := format('sed ''s/|$//'' %s/%s.tbl', _data_dir, _tbl);
+            ELSE
+                _load_cmd := format('cat %s/chunk_*/%s.tbl | sed ''s/|$//''',
+                                    _data_dir, _tbl);
+            END IF;
             EXECUTE format(
                 'COPY tpch.%I FROM PROGRAM %L WITH (DELIMITER %L, NULL %L)',
-                _tbl,
-                format('sed ''s/|$//'' %s/%s.tbl', _data_dir, _tbl),
-                '|',
-                ''
+                _tbl, _load_cmd, '|', ''
             );
             GET DIAGNOSTICS _row_count = ROW_COUNT;
             _total_rows := _total_rows + _row_count;
@@ -361,8 +387,13 @@ BEGIN
     END LOOP;
 
     -- Clean up .tbl files to free disk space
-    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-        format('rm -f %s/*.tbl', _data_dir));
+    IF parallel = 1 THEN
+        EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+            format('rm -f %s/*.tbl', _data_dir));
+    ELSE
+        EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+            format('rm -rf %s/chunk_*', _data_dir));
+    END IF;
     RAISE NOTICE 'Cleaned up .tbl files from %', _data_dir;
 
     -- Save scale factor so gen_query() can pick it up
@@ -371,7 +402,7 @@ BEGIN
         INSERT INTO tpch.config (key, value) VALUES ('scale_factor', scale_factor::TEXT);
     END IF;
 
-    RETURN format('Loaded %s total rows at SF=%s', _total_rows, scale_factor);
+    RETURN format('Loaded %s total rows at SF=%s (parallel=%s)', _total_rows, scale_factor, parallel);
 END;
 $func$;
 
