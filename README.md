@@ -76,7 +76,7 @@ Per-query output is written to `results_dir` (`queryXX.out` or `queryXX_explain.
 | `tpch.gen_data(scale, parallel=1)` | TEXT | Generate .tbl files via dbgen. Set `parallel > 1` for multiple workers. |
 | `tpch.load_data()` | TEXT | Load .tbl files into tables and analyze. Can be re-run without regenerating. |
 | `tpch.clean_data()` | TEXT | Delete .tbl files from data_dir to free disk space. |
-| `tpch.gen_query(seed)` | TEXT | Generate 22 queries, store in `tpch.query` table and `query_dir` |
+| `tpch.gen_query(scale)` | TEXT | Generate 22 queries. `scale` overrides config (default: from gen_data). |
 | `tpch.show(qid)` | TEXT | Return query text |
 | `tpch.exec(qid)` | TEXT | Execute one query, save result to `tpch.bench_results` |
 | `tpch.bench(mode)` | TEXT | Run or explain all 22 queries, update `bench_summary` |

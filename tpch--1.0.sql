@@ -494,10 +494,11 @@ END;
 $func$;
 
 -- =============================================================================
--- gen_query(seed) — generate 22 queries via qgen, fix, store
---   Scale is read from gen_data() automatically.
+-- gen_query(scale) — generate 22 queries via qgen, fix, store
+--   scale defaults to the value saved by gen_data(), or 1 if not set.
+--   Useful for regenerating queries at a different scale without re-running gen_data().
 -- =============================================================================
-CREATE OR REPLACE FUNCTION tpch.gen_query(seed INTEGER DEFAULT NULL)
+CREATE OR REPLACE FUNCTION tpch.gen_query(scale INTEGER DEFAULT NULL)
 RETURNS TEXT
 LANGUAGE plpgsql
 AS $func$
@@ -509,20 +510,19 @@ DECLARE
     _raw TEXT;
     _fixed TEXT;
     _i INTEGER;
-    _seed_arg TEXT := '';
     _count INTEGER := 0;
 BEGIN
     _tpch_dir := tpch._resolve_dir('tpch_dir', 'tpch_dbgen');
     _query_dir := tpch._resolve_dir('query_dir', 'tpch_query');
 
-    -- Read scale factor saved by gen_data(), default to 1
-    SELECT value::INTEGER INTO _scale FROM tpch.config WHERE key = 'scale_factor';
-    IF _scale IS NULL THEN
-        _scale := 1;
-    END IF;
-
-    IF seed IS NOT NULL THEN
-        _seed_arg := format(' -r %s', seed);
+    -- Use explicit scale if provided, otherwise read from config
+    IF scale IS NOT NULL THEN
+        _scale := scale;
+    ELSE
+        SELECT value::INTEGER INTO _scale FROM tpch.config WHERE key = 'scale_factor';
+        IF _scale IS NULL THEN
+            _scale := 1;
+        END IF;
     END IF;
 
     DELETE FROM tpch.query;
@@ -538,8 +538,8 @@ BEGIN
     FOR _i IN 1..22 LOOP
         TRUNCATE _qgen_out;
 
-        _cmd := format('cd %s/dbgen && DSS_QUERY=%s/dbgen/queries ./qgen -s %s -d %s%s | tr -d ''\r''',
-            _tpch_dir, _tpch_dir, _scale, _i, _seed_arg);
+        _cmd := format('cd %s/dbgen && DSS_QUERY=%s/dbgen/queries ./qgen -s %s -d %s | tr -d ''\r''',
+            _tpch_dir, _tpch_dir, _scale, _i);
 
         BEGIN
             EXECUTE format('COPY _qgen_out FROM PROGRAM %L WITH (DELIMITER E''\x01'')', _cmd);
