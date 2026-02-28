@@ -392,7 +392,7 @@ $func$;
 
 -- =============================================================================
 -- load_data() — load .tbl files from data_dir into tables, then analyze
--- Reads parallel from config (saved by gen_data) to determine file layout.
+-- Auto-detects parallelism from data file layout (single files vs chunk_N subdirs).
 -- =============================================================================
 CREATE OR REPLACE FUNCTION tpch.load_data()
 RETURNS TEXT
@@ -416,10 +416,21 @@ BEGIN
         _data_dir := '/tmp/tpch_data';
     END IF;
 
-    SELECT value::INTEGER INTO _parallel FROM tpch.config WHERE key = 'parallel';
-    IF _parallel IS NULL THEN
+    -- Auto-detect parallelism from data files (no config dependency)
+    IF EXISTS (
+        SELECT 1 FROM pg_ls_dir(_data_dir) f WHERE f = 'nation.tbl'
+    ) THEN
         _parallel := 1;
+    ELSIF EXISTS (
+        SELECT 1 FROM pg_ls_dir(_data_dir) f WHERE f ~ '^chunk_\d+$'
+    ) THEN
+        SELECT count(*)::INTEGER INTO _parallel
+        FROM pg_ls_dir(_data_dir) f
+        WHERE f ~ '^chunk_\d+$';
+    ELSE
+        RAISE EXCEPTION 'No TPC-H data files found in %', _data_dir;
     END IF;
+    RAISE NOTICE 'Auto-detected parallel = % from data files', _parallel;
 
     -- Truncate all tables before loading
     FOREACH _tbl IN ARRAY _tables LOOP
