@@ -6,6 +6,9 @@ TPC-H-V3.0.1/dbgen/qgen
 # Re-extract from TPC-H-TOOL.zip if needed: unzip TPC-H-TOOL.zip 'TPC-H V3.0.1/ref_data/*'
 TPC-H-V3.0.1/ref_data/
 TPC-H-V3.0.1/specification.*
+# Generated config (machine-specific)
+*_postgres.conf
+
 # pg_regress output
 results/
 regression.diffs

@@ -32,28 +32,58 @@ make install
 > rm -r 'TPC-H V3.0.1'
 > ```
 
+## Configure PostgreSQL
+
+Default PostgreSQL settings (`shared_buffers = 128MB`, `work_mem = 4MB`, etc.) are far too
+conservative for analytical workloads. `gen_pg_conf.py` auto-detects your hardware (CPU,
+RAM, disk type) and generates an optimized `tpch_postgres.conf` with recommended settings
+synthesized from [PostgreSQL Wiki](https://wiki.postgresql.org/wiki/Tuning_Your_PostgreSQL_Server)
+and [EDB OLAP tuning guide](https://www.enterprisedb.com/postgres-tutorials/trying-many-hats-how-improve-olap-workload-performance-postgresql),
+combined with benchmark experience. The output is a starting point — adjust to your workload.
+
+```bash
+python3 gen_pg_conf.py              # writes tpch_postgres.conf
+python3 gen_pg_conf.py --dry-run    # preview without writing
+```
+
+Apply it and restart:
+
+```bash
+echo "include = '$(pwd)/tpch_postgres.conf'" >> $(psql -tA -c "SHOW config_file")
+pg_ctl restart -D $(psql -tA -c "SHOW data_directory")
+```
+
+Key parameters tuned: `shared_buffers` (25% RAM), `effective_cache_size` (75% RAM),
+`work_mem`, `max_parallel_workers_per_gather`, `random_page_cost` (SSD vs HDD),
+`max_wal_size`, `jit`, and more. See the generated file for details.
+
 ## Quick Start
 
 ### One-shot
 
 ```sql
 CREATE EXTENSION tpch;
-SELECT tpch.config('data_dir', '/data/tpch_tmp');  -- set data dir (default: /tmp/tpch_data)
-CALL tpch.run(1, 8);  -- 1 scale factor (GB), 8 parallel workers
+CALL tpch.run();  -- SF=1, single-threaded (default)
 ```
 
 `run()` executes the full pipeline: schema → data generation → load → query generation → benchmark.
+
+```sql
+-- For larger scale factors:
+SELECT tpch.config('data_dir', '/data/tpch_tmp');  -- optional: set data dir (default: /tmp/tpch_data)
+CALL tpch.run(100, 8);  -- SF=100 (~100 GB), 8 parallel workers
+```
 
 ### Step by step
 
 ```sql
 CREATE EXTENSION tpch;
-SELECT tpch.gen_schema();         -- 1. create 8 TPC-H tables
-SELECT tpch.gen_data(1, 8);       -- 2. generate SF-1 (~1 GB) .tbl files, 8 parallel workers
-SELECT tpch.load_data(8);         -- 3. load .tbl files into tables, 8 parallel workers
-SELECT tpch.gen_query(1);         -- 4. generate 22 queries for SF-1
-SELECT tpch.bench();              -- 5. run all 22 queries
-SELECT tpch.clean_data();         -- 6. (optional) delete .tbl files to free disk space
+SELECT tpch.gen_schema();          -- 1. create 8 TPC-H tables
+SELECT tpch.gen_data(1, 8);        -- 2. generate SF-1 (~1 GB) .tbl files, 8 parallel workers
+SELECT tpch.load_data(8);          -- 3. load .tbl files into tables, 8 parallel workers
+SELECT tpch.gen_query();           -- 4. generate 22 queries (scale auto-detected from gen_data)
+SELECT tpch.bench();               -- 5. run all 22 queries
+SELECT tpch.clean_data();          -- 6. (optional) delete .tbl files to free disk space
 ```
 
 Check the latest results:
@@ -76,7 +106,7 @@ Built and tested on **PostgreSQL 19devel**. Older versions should also work. If 
 | `tpch.gen_data(scale, parallel=1)` | TEXT | Generate .tbl files via dbgen |
 | `tpch.load_data(workers=4)` | TEXT | Load .tbl files into tables and analyze |
 | `tpch.clean_data()` | TEXT | Delete .tbl files from data_dir to free disk space |
-| `tpch.gen_query(scale)` | TEXT | Generate 22 queries for the given scale factor |
+| `tpch.gen_query(scale=auto)` | TEXT | Generate 22 queries; scale auto-detected from `gen_data`, default 1 |
 | `tpch.show(qid)` | TEXT | Return query text |
 | `tpch.exec(qid)` | TEXT | Execute one query, save result to `tpch.bench_results` |
 | `tpch.bench(mode)` | TEXT | Run or explain all 22 queries, update `bench_summary` |
