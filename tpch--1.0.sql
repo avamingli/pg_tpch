@@ -391,83 +391,252 @@ END;
 $func$;
 
 -- =============================================================================
--- load_data() — load .tbl files from data_dir into tables, then analyze
+-- load_data(workers) — load .tbl files into tables in parallel, then rebuild PKs
 -- Auto-detects parallelism from data file layout (single files vs chunk_N subdirs).
+-- workers controls how many tables are processed concurrently (default 4).
+--
+-- Key optimization: drops all PKs before COPY, rebuilds them after.
+-- Eliminates WAL lock contention from concurrent B-tree index maintenance.
+-- Phases: TRUNCATE+DROP PKs → parallel COPY → parallel ADD PK → parallel ANALYZE
+-- Progress is logged to /tmp/tpch_load_<pid>.log
 -- =============================================================================
-CREATE OR REPLACE FUNCTION tpch.load_data()
+CREATE OR REPLACE FUNCTION tpch.load_data(workers INTEGER DEFAULT 4)
 RETURNS TEXT
 LANGUAGE plpgsql
 AS $func$
 DECLARE
-    _data_dir TEXT;
-    _parallel INTEGER;
-    _tbl TEXT;
-    _tables TEXT[] := ARRAY[
+    _data_dir    TEXT;
+    _parallel    INTEGER;
+    _tbl         TEXT;
+    _tables      TEXT[] := ARRAY[
         'nation','region','part','supplier',
         'partsupp','customer','orders','lineitem'
     ];
-    _start_ts TIMESTAMPTZ;
-    _row_count BIGINT;
-    _total_rows BIGINT := 0;
-    _load_cmd TEXT;
+    _start_ts    TIMESTAMPTZ;
+    _load_prog   TEXT;
+    _sql_file    TEXT;
+    _setup_file  TEXT;
+    _pk_file     TEXT;
+    _main_sh     TEXT;
+    _script      TEXT[];
+    _setup_lines TEXT[];
+    _pid         TEXT;
+    _port        TEXT;
+    _socket      TEXT;
+    _dbname      TEXT;
+    _user        TEXT;
+    _logfile     TEXT;
+    _errfile     TEXT;
+    _psql_base   TEXT;
+    _total_rows  BIGINT;
+    _rec         RECORD;
 BEGIN
+    /* 1. Resolve data_dir */
     SELECT value INTO _data_dir FROM tpch.config WHERE key = 'data_dir';
     IF _data_dir IS NULL OR _data_dir = '' THEN
         _data_dir := '/tmp/tpch_data';
     END IF;
 
-    -- Auto-detect parallelism from data files (no config dependency)
-    IF EXISTS (
-        SELECT 1 FROM pg_ls_dir(_data_dir) f WHERE f = 'nation.tbl'
-    ) THEN
+    /* 2. Auto-detect parallelism from data files */
+    IF EXISTS (SELECT 1 FROM pg_ls_dir(_data_dir) f WHERE f = 'nation.tbl') THEN
         _parallel := 1;
-    ELSIF EXISTS (
-        SELECT 1 FROM pg_ls_dir(_data_dir) f WHERE f ~ '^chunk_\d+$'
-    ) THEN
+    ELSIF EXISTS (SELECT 1 FROM pg_ls_dir(_data_dir) f WHERE f ~ '^chunk_\d+$') THEN
         SELECT count(*)::INTEGER INTO _parallel
-        FROM pg_ls_dir(_data_dir) f
-        WHERE f ~ '^chunk_\d+$';
+        FROM pg_ls_dir(_data_dir) f WHERE f ~ '^chunk_\d+$';
     ELSE
         RAISE EXCEPTION 'No TPC-H data files found in %', _data_dir;
     END IF;
-    RAISE NOTICE 'Auto-detected parallel = % from data files', _parallel;
 
-    -- Truncate all tables before loading
+    /* 3. Connection parameters for background psql processes */
+    _pid       := pg_backend_pid()::TEXT;
+    _dbname    := current_database();
+    _user      := current_user;
+    _logfile   := '/tmp/tpch_load_' || _pid || '.log';
+    _errfile   := '/tmp/tpch_load_' || _pid || '.err';
+    SELECT setting INTO _port FROM pg_settings WHERE name = 'port';
+    SELECT trim(split_part(setting, ',', 1)) INTO _socket
+        FROM pg_settings WHERE name = 'unix_socket_directories';
+    _psql_base := 'psql -h ' || _socket || ' -p ' || _port ||
+                  ' -U ' || _user || ' -d ' || _dbname ||
+                  ' -v ON_ERROR_STOP=1';
+
+    /* 4. Write setup SQL file: TRUNCATE + DROP all PKs */
+    _setup_file  := '/tmp/tpch_' || _pid || '_setup.sql';
+    _setup_lines := ARRAY[
+        'TRUNCATE ' || (
+            SELECT string_agg('tpch.' || quote_ident(t), ', ')
+            FROM unnest(_tables) AS t
+        ) || ' CASCADE;'
+    ] || ARRAY(
+        SELECT format('ALTER TABLE tpch.%I DROP CONSTRAINT IF EXISTS %I;',
+                      t, t || '_pkey')
+        FROM unnest(_tables) AS t
+    );
+    EXECUTE format(
+        'COPY (SELECT line FROM unnest(%L::text[]) AS line) TO PROGRAM %L WITH (FORMAT text)',
+        _setup_lines,
+        'cat > ' || _setup_file
+    );
+
+    /* 5. Write per-table COPY SQL files */
     FOREACH _tbl IN ARRAY _tables LOOP
-        EXECUTE format('TRUNCATE tpch.%I CASCADE', _tbl);
+        IF _parallel = 1 THEN
+            _load_prog := format('sed ''s/|$//'' %s/%s.tbl', _data_dir, _tbl);
+        ELSE
+            _load_prog := format('cat %s/chunk_*/%s.tbl | sed ''s/|$//''',
+                                 _data_dir, _tbl);
+        END IF;
+        _sql_file := '/tmp/tpch_' || _pid || '_copy_' || _tbl || '.sql';
+        EXECUTE format(
+            'COPY (SELECT %L) TO PROGRAM %L WITH (FORMAT text)',
+            format('COPY tpch.%I FROM PROGRAM $tpch_prog$%s$tpch_prog$ WITH (DELIMITER %L, NULL %L);',
+                   _tbl, _load_prog, '|', ''),
+            'cat > ' || _sql_file
+        );
     END LOOP;
 
-    -- Load each table via COPY FROM PROGRAM (strip trailing pipe).
-    -- With parallel > 1, cat the same-named file from every chunk subdirectory.
-    FOREACH _tbl IN ARRAY _tables LOOP
-        _start_ts := clock_timestamp();
-        BEGIN
-            IF _parallel = 1 THEN
-                _load_cmd := format('sed ''s/|$//'' %s/%s.tbl', _data_dir, _tbl);
-            ELSE
-                _load_cmd := format('cat %s/chunk_*/%s.tbl | sed ''s/|$//''',
-                                    _data_dir, _tbl);
-            END IF;
-            EXECUTE format(
-                'COPY tpch.%I FROM PROGRAM %L WITH (DELIMITER %L, NULL %L)',
-                _tbl, _load_cmd, '|', ''
-            );
-            GET DIAGNOSTICS _row_count = ROW_COUNT;
-            _total_rows := _total_rows + _row_count;
-            RAISE NOTICE 'Loaded % rows into % (% sec)',
-                _row_count, _tbl,
-                round(extract(epoch from clock_timestamp() - _start_ts)::numeric, 2);
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'Failed to load %: %', _tbl, SQLERRM;
-        END;
+    /* 6. Write per-table ADD PRIMARY KEY SQL files */
+    FOR _rec IN
+        SELECT t.relname AS tbl,
+               string_agg(a.attname, ', ' ORDER BY k.n) AS pk_cols
+        FROM pg_class t
+        JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = 'tpch'
+        JOIN pg_index ix ON ix.indrelid = t.oid AND ix.indisprimary
+        JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+        WHERE t.relname = ANY(_tables)
+        GROUP BY t.relname
+    LOOP
+        _pk_file := '/tmp/tpch_' || _pid || '_pk_' || _rec.tbl || '.sql';
+        EXECUTE format(
+            'COPY (SELECT %L) TO PROGRAM %L WITH (FORMAT text)',
+            format('SET max_parallel_maintenance_workers = %s; ALTER TABLE tpch.%I ADD PRIMARY KEY (%s);',
+                   workers, _rec.tbl, _rec.pk_cols),
+            'cat > ' || _pk_file
+        );
     END LOOP;
 
-    -- ANALYZE all tables
+    /* 7. Build main bash script */
+    _script := ARRAY[
+        '#!/bin/bash',
+        'MAX=' || workers,
+        'PSQL="' || _psql_base || '"',
+        'LOG="' || _logfile || '"',
+        'ERR="' || _errfile || '"',
+        'rm -f "$ERR"',
+        '',
+        'run_copy() {',
+        '    local f=$1 tbl=$2 t0=$(date +%s)',
+        '    $PSQL -f "$f" >> "$LOG" 2>&1',
+        '    local rc=$? e=$(( $(date +%s) - t0 ))',
+        '    if [ $rc -ne 0 ]; then echo "$tbl" >> "$ERR"; fi',
+        '    echo "  COPY $tbl ${e}s $([ $rc -eq 0 ] && echo OK || echo FAILED)" | tee -a "$LOG"',
+        '}',
+        'run_pk() {',
+        '    local f=$1 tbl=$2 t0=$(date +%s)',
+        '    $PSQL -f "$f" >> "$LOG" 2>&1',
+        '    local rc=$? e=$(( $(date +%s) - t0 ))',
+        '    if [ $rc -ne 0 ]; then echo "$tbl PK" >> "$ERR"; fi',
+        '    echo "  PK $tbl ${e}s $([ $rc -eq 0 ] && echo OK || echo FAILED)" | tee -a "$LOG"',
+        '}',
+        'run_analyze() {',
+        '    local tbl=$1',
+        '    $PSQL -c "ANALYZE tpch.$tbl;" >> "$LOG" 2>&1',
+        '    echo "  ANALYZE $tbl done" | tee -a "$LOG"',
+        '}',
+        '',
+        'echo "=== TPC-H load started: workers=' || workers ||
+            ', file-parallel=' || _parallel || ', $(date) ===" | tee "$LOG"',
+        '',
+        '# Phase 1: TRUNCATE + DROP PKs',
+        '$PSQL -f "' || _setup_file || '" >> "$LOG" 2>&1 && echo "Setup done (truncated + dropped PKs)." | tee -a "$LOG"',
+        '',
+        '# Phase 2: Parallel COPY — no indexes, no WAL lock contention'
+    ];
+
     FOREACH _tbl IN ARRAY _tables LOOP
-        EXECUTE format('ANALYZE tpch.%I', _tbl);
+        _sql_file := '/tmp/tpch_' || _pid || '_copy_' || _tbl || '.sql';
+        _script := _script || (
+            'while [ $(jobs -r 2>/dev/null | wc -l) -ge $MAX ]; do sleep 0.1; done' ||
+            '; run_copy "' || _sql_file || '" ' || _tbl || ' &'
+        );
     END LOOP;
 
-    RETURN format('Loaded %s total rows from %s', _total_rows, _data_dir);
+    _script := _script || ARRAY[
+        'wait',
+        'echo "COPY done: $(date)" | tee -a "$LOG"',
+        '',
+        '# Phase 3: Parallel ADD PRIMARY KEY (sort-based, max_parallel_maintenance_workers=' || workers || ')'
+    ];
+
+    FOR _rec IN
+        SELECT t.relname AS tbl
+        FROM pg_class t
+        JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = 'tpch'
+        JOIN pg_index ix ON ix.indrelid = t.oid AND ix.indisprimary
+        WHERE t.relname = ANY(_tables)
+        ORDER BY t.relname
+    LOOP
+        _pk_file := '/tmp/tpch_' || _pid || '_pk_' || _rec.tbl || '.sql';
+        _script := _script || (
+            'while [ $(jobs -r 2>/dev/null | wc -l) -ge $MAX ]; do sleep 0.1; done' ||
+            '; run_pk "' || _pk_file || '" ' || _rec.tbl || ' &'
+        );
+    END LOOP;
+
+    _script := _script || ARRAY[
+        'wait',
+        'echo "PK rebuild done: $(date)" | tee -a "$LOG"',
+        '',
+        '# Phase 4: Parallel ANALYZE'
+    ];
+
+    FOREACH _tbl IN ARRAY _tables LOOP
+        _script := _script || (
+            'while [ $(jobs -r 2>/dev/null | wc -l) -ge $MAX ]; do sleep 0.1; done' ||
+            '; run_analyze ' || _tbl || ' &'
+        );
+    END LOOP;
+
+    _script := _script || ARRAY[
+        'wait',
+        'echo "=== All done: $(date) ===" | tee -a "$LOG"',
+        'if [ -f "$ERR" ]; then',
+        '    echo "FAILED:" && cat "$ERR" && exit 1',
+        'fi'
+    ];
+
+    /* 8. Write and execute main script */
+    _main_sh := '/tmp/tpch_' || _pid || '_main.sh';
+    EXECUTE format(
+        'COPY (SELECT line FROM unnest(%L::text[]) AS line) TO PROGRAM %L WITH (FORMAT text)',
+        _script,
+        'cat > ' || _main_sh
+    );
+
+    _start_ts := clock_timestamp();
+    RAISE NOTICE 'Launching % parallel workers (file-parallel=%), log: %',
+        workers, _parallel, _logfile;
+
+    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', 'bash ' || _main_sh);
+
+    /* 9. Cleanup temp files */
+    EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
+        'rm -f /tmp/tpch_' || _pid || '_copy_*.sql'
+        || ' /tmp/tpch_' || _pid || '_pk_*.sql'
+        || ' /tmp/tpch_' || _pid || '_setup.sql'
+        || ' /tmp/tpch_' || _pid || '_main.sh'
+    );
+
+    /* 10. Row count from pg_class after ANALYZE */
+    SELECT sum(reltuples::BIGINT) INTO _total_rows
+    FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE n.nspname = 'tpch' AND c.relname = ANY(_tables);
+
+    RETURN format('Loaded ~%s rows from %s in %s sec (workers=%s, file-parallel=%s). Log: %s',
+        _total_rows, _data_dir,
+        round(extract(epoch from clock_timestamp() - _start_ts)::numeric, 1),
+        workers, _parallel, _logfile);
 END;
 $func$;
 
