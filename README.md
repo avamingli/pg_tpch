@@ -38,8 +38,8 @@ make install
 
 ```sql
 CREATE EXTENSION tpch;
-SELECT tpch.config('data_dir', '/data/tpch_tmp');   -- set data dir (default: /tmp/tpch_data)
-CALL tpch.run(scale := 1, parallel := 8);         -- full pipeline with 8 workers
+SELECT tpch.config('data_dir', '/data/tpch_tmp');  -- set data dir (default: /tmp/tpch_data)
+CALL tpch.run(1, 8);  -- 1 scale factor (GB), 8 parallel workers
 ```
 
 `run()` executes the full pipeline: schema → data generation → load → query generation → benchmark.
@@ -87,8 +87,8 @@ Built and tested on **PostgreSQL 19devel**. Older versions should also work. If 
 Runs the complete benchmark pipeline in one call.
 
 ```sql
-CALL tpch.run();                           -- SF=1, single-threaded
-CALL tpch.run(scale := 100, parallel := 8);    -- SF=100, 8 dbgen workers
+CALL tpch.run();        -- SF=1, single-threaded
+CALL tpch.run(100, 8);  -- SF=100, 8 dbgen workers
 ```
 
 `parallel` controls both data generation (dbgen workers) and loading (table-COPY workers, capped
