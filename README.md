@@ -34,18 +34,27 @@ make install
 
 ## Quick Start
 
+### One-shot
+
 ```sql
-CREATE EXTENSION tpch;        -- 1. install the extension
-SELECT tpch.gen_schema();     -- 2. create 8 TPC-H tables
-SELECT tpch.gen_data(1);      -- 3. generate SF-1 (~1GB) .tbl files
-SELECT tpch.gen_data(1, 8);   -- 3. same, but with 8 parallel workers
-SELECT tpch.load_data();      -- 4. load .tbl files into tables (auto-analyzes)
-SELECT tpch.gen_query();      -- 5. generate 22 queries, saved to query_dir as .sql files
-SELECT tpch.bench();          -- 6. run all 22 queries, results + summary.csv in results_dir
-SELECT tpch.clean_data();     -- 7. (optional) delete .tbl files to free disk space
+CREATE EXTENSION tpch;
+SELECT tpch.config('data_dir', '/data/tpch_tmp');   -- set data dir (default: /tmp/tpch_data)
+CALL tpch.run(scale := 1, parallel := 8);         -- full pipeline with 8 workers
 ```
 
-That's it. Schema, data, queries, benchmark — done.
+`run()` executes the full pipeline: schema → data generation → load → query generation → benchmark.
+
+### Step by step
+
+```sql
+CREATE EXTENSION tpch;
+SELECT tpch.gen_schema();         -- 1. create 8 TPC-H tables
+SELECT tpch.gen_data(1, 8);       -- 2. generate SF-1 (~1 GB) .tbl files, 8 parallel workers
+SELECT tpch.load_data(8);         -- 3. load .tbl files into tables, 8 parallel workers
+SELECT tpch.gen_query(1);         -- 4. generate 22 queries for SF-1
+SELECT tpch.bench();              -- 5. run all 22 queries
+SELECT tpch.clean_data();         -- 6. (optional) delete .tbl files to free disk space
+```
 
 Check the latest results:
 
@@ -55,16 +64,6 @@ SELECT * FROM tpch.bench_summary;
 
 Built and tested on **PostgreSQL 19devel**. Older versions should also work. If not, please create an issue.
 
-## Run the Benchmark
-
-```sql
-SELECT tpch.bench();                               -- run all 22 queries
-SELECT tpch.bench('EXPLAIN');                       -- explain all 22 queries
-SELECT tpch.bench('EXPLAIN (ANALYZE, COSTS OFF)');  -- explain with options
-```
-
-Per-query output is written to `results_dir` (`queryXX.out` or `queryXX_explain.out`), plus a `summary.csv` with timing for all 22 queries. The `tpch.bench_summary` table is updated after each run.
-
 ## Functions
 
 | Function | Returns | Description |
@@ -72,15 +71,28 @@ Per-query output is written to `results_dir` (`queryXX.out` or `queryXX_explain.
 | `tpch.config(key)` | TEXT | Get config value |
 | `tpch.config(key, value)` | TEXT | Set config value |
 | `tpch.info()` | TABLE | Show all resolved paths and scale factor |
+| `tpch.run(scale, parallel=1)` | — | Full pipeline: gen_schema → gen_data → load_data → gen_query → bench |
 | `tpch.gen_schema()` | TEXT | Create 8 TPC-H tables under `tpch` schema |
-| `tpch.gen_data(scale, parallel=1)` | TEXT | Generate .tbl files via dbgen. Set `parallel > 1` for multiple workers. |
-| `tpch.load_data()` | TEXT | Load .tbl files into tables and analyze. Can be re-run without regenerating. |
-| `tpch.clean_data()` | TEXT | Delete .tbl files from data_dir to free disk space. |
-| `tpch.gen_query(scale)` | TEXT | Generate 22 queries. `scale` overrides config (default: from gen_data). |
+| `tpch.gen_data(scale, parallel=1)` | TEXT | Generate .tbl files via dbgen |
+| `tpch.load_data(workers=4)` | TEXT | Load .tbl files into tables and analyze |
+| `tpch.clean_data()` | TEXT | Delete .tbl files from data_dir to free disk space |
+| `tpch.gen_query(scale)` | TEXT | Generate 22 queries for the given scale factor |
 | `tpch.show(qid)` | TEXT | Return query text |
 | `tpch.exec(qid)` | TEXT | Execute one query, save result to `tpch.bench_results` |
 | `tpch.bench(mode)` | TEXT | Run or explain all 22 queries, update `bench_summary` |
 | `tpch.explain(qid, opts)` | SETOF TEXT | EXPLAIN a single query |
+
+### run(scale, parallel)
+
+Runs the complete benchmark pipeline in one call.
+
+```sql
+CALL tpch.run();                           -- SF=1, single-threaded
+CALL tpch.run(scale := 100, parallel := 8);    -- SF=100, 8 dbgen workers
+```
+
+`parallel` controls both data generation (dbgen workers) and loading (table-COPY workers, capped
+internally at `LEAST(parallel, 8)` since TPC-H has only 8 tables).
 
 ### show(qid)
 
@@ -115,15 +127,19 @@ SELECT * FROM tpch.explain(6, 'COSTS OFF');
 
 ### bench(mode)
 
+Run all 22 queries and record results.
+
 ```sql
-SELECT tpch.bench();                               -- execute
-SELECT tpch.bench('EXPLAIN');                       -- explain
-SELECT tpch.bench('EXPLAIN (ANALYZE, COSTS OFF)');  -- explain with options
+SELECT tpch.bench();                               -- execute all 22 queries
+SELECT tpch.bench('EXPLAIN');                      -- explain all 22 queries
+SELECT tpch.bench('EXPLAIN (ANALYZE, COSTS OFF)'); -- explain with options
 ```
 
 Output saved to `results_dir`:
 - Per-query: `query1.out` ... `query22.out` (or `query1_explain.out` ... `query22_explain.out`)
 - Summary: `summary.csv` — query_id, status, duration_ms, rows_returned
+
+`tpch.bench_summary` is updated after each run with the latest results.
 
 ## Where Things Are Stored
 
@@ -143,7 +159,7 @@ Output saved to `results_dir`:
 |-----------|----------|
 | `query_dir` | `query1.sql` ... `query22.sql` from `gen_query()` |
 | `results_dir` | Per-query `.out` files and `summary.csv` from `bench()` |
-| `data_dir` | Temporary `.tbl` files from `gen_data()`, cleaned up after load (default: `/tmp/tpch_data`) |
+| `data_dir` | Temporary `.tbl` files from `gen_data()` (default: `/tmp/tpch_data`) |
 
 Check all resolved paths:
 
@@ -177,7 +193,7 @@ SELECT tpch.config('query_dir', '/data/queries');
 
 `gen_query()` automatically patches raw `qgen` output:
 
-1. **Interval precision** — `interval '90' day (3)` &rarr; `interval '90' day` (strip unsupported precision qualifier)
+1. **Interval precision** — `interval '90' day (3)` → `interval '90' day` (strip unsupported precision qualifier)
 2. **Standalone LIMIT** — relocates `LIMIT N` from separate line into the query body
 3. **Control directives** — strips qgen directives (`:x`, `:o`, `:n`, etc.) and carriage returns
 4. **Query 15 (Top Supplier)** — `CREATE VIEW` / `DROP VIEW` handled as DDL in explain and bench modes

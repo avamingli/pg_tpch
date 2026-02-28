@@ -1110,13 +1110,12 @@ $func$;
 --   5. bench()                    — execute all queries and record results
 --
 -- Returns a text summary of each phase's output.
-CREATE OR REPLACE FUNCTION tpch.run(
+CREATE OR REPLACE PROCEDURE tpch.run(
     scale    INTEGER DEFAULT 1,
     parallel INTEGER DEFAULT 1
 )
-RETURNS TEXT
 LANGUAGE plpgsql
-AS $func$
+AS $proc$
 DECLARE
     _workers   INTEGER;
     _t0        TIMESTAMPTZ;
@@ -1132,39 +1131,37 @@ BEGIN
     RAISE NOTICE 'run(): scale=%, parallel=% (gen_data), load workers=%',
         scale, parallel, _workers;
 
-    /* 1. Schema */
+    /* 1. Schema — COMMIT immediately so tables are visible to background
+       psql workers launched by load_data() in step 3. */
     RAISE NOTICE 'run(): step 1/5 — gen_schema()';
     SELECT tpch.gen_schema() INTO _schema;
+    COMMIT;
 
     /* 2. Data generation */
     RAISE NOTICE 'run(): step 2/5 — gen_data(%, %)', scale, parallel;
     SELECT tpch.gen_data(scale, parallel) INTO _gendata;
+    COMMIT;
 
     /* 3. Load */
     RAISE NOTICE 'run(): step 3/5 — load_data(%)', _workers;
     SELECT tpch.load_data(_workers) INTO _load;
+    COMMIT;
 
     /* 4. Query generation */
     RAISE NOTICE 'run(): step 4/5 — gen_query(%)', scale;
     SELECT tpch.gen_query(scale) INTO _genquery;
+    COMMIT;
 
     /* 5. Benchmark */
     RAISE NOTICE 'run(): step 5/5 — bench()';
     SELECT tpch.bench() INTO _bench;
 
-    RETURN format(
-        E'=== TPC-H run complete in %s sec (scale=%s, parallel=%s, load_workers=%s) ===\n'
-        'gen_schema : %s\n'
-        'gen_data   : %s\n'
-        'load_data  : %s\n'
-        'gen_query  : %s\n'
-        'bench      : %s',
+    RAISE NOTICE E'=== TPC-H run complete in % sec (scale=%, parallel=%, load_workers=%) ===\ngen_schema : %\ngen_data   : %\nload_data  : %\ngen_query  : %\nbench      : %',
         round(extract(epoch from clock_timestamp() - _t0)::numeric, 1),
         scale, parallel, _workers,
-        _schema, _gendata, _load, _genquery, _bench
-    );
+        _schema, _gendata, _load, _genquery, _bench;
 END;
-$func$;
+$proc$;
 
 -- =============================================================================
 -- Extension loaded — remind user to configure data_dir
@@ -1175,7 +1172,7 @@ BEGIN
         '  tpch extension installed.\n'
         '  Default data_dir is /tmp/tpch_data — this may be too small for large scale factors.\n'
         '  To change it:  SELECT tpch.config(''data_dir'', ''/your/path'');\n'
-        '  One-shot:      SELECT tpch.run(scale := 1, parallel := 4);\n'
+        '  One-shot:      CALL tpch.run(scale := 1, parallel := 4);\n'
         '  Step by step:  SELECT tpch.gen_schema();\n'
         '                 SELECT tpch.gen_data(1, 4);\n'
         '                 SELECT tpch.load_data(4);\n'
