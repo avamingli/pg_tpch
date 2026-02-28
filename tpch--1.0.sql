@@ -995,7 +995,9 @@ BEGIN
             _err_count := _err_count + 1;
         END IF;
 
-        RAISE NOTICE 'query %: % (% ms)', _qid, _status, round(_total_dur);
+        RAISE NOTICE '[%/22] query %: % (% ms)  elapsed %s',
+            _qid, _qid, _status, round(_total_dur),
+            round(extract(epoch from clock_timestamp() - _bench_start)::numeric, 1);
     END LOOP;
 
     -- Update bench_summary table with latest run
